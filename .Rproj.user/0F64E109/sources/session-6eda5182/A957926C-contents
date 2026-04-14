@@ -1,0 +1,282 @@
+---
+title: "Is Cholesterol Overrated? Examining Its Independent Effect on Heart Disease Risk"
+author: "Logan Calder, Chase Mayer, Anirudh Ramesh"
+date: "`r Sys.Date()`"
+output:
+  latex_document:
+    latex_engine: xelatex
+    number_sections: false
+documentclass: scrartcl
+geometry: margin=1in
+fontsize: 11pt
+mainfont: "Times New Roman"
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \usepackage{caption}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.pos = "H"
+)
+
+library(tidyverse)
+library(sandwich)
+library(lmtest)
+library(stargazer)
+library(patchwork)
+```
+
+```{r load-and-clean, include=FALSE}
+# ── Load data ──────────────────────────────────────────────────────────────────
+# UCI Heart Disease dataset (all four sites):
+# https://archive.ics.uci.edu/dataset/45/heart+disease
+url <- "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.cleveland.data"
+
+col_names <- c("age","sex","cp","trestbps","chol","fbs","restecg",
+               "thalach","exang","oldpeak","slope","ca","thal","num")
+
+# Cleveland only
+cleveland_raw <- read.csv(
+  url, header = FALSE, col.names = col_names, na.strings = "?"
+)
+
+# All four sites combined (manually assembled by UCI)
+sites <- c(
+  "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.cleveland.data",
+  "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.hungarian.data",
+  "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.switzerland.data",
+  "https://archive.ics.uci.edu/ml/machine-learning-databases/heart-disease/processed.va.data"
+)
+
+all_raw <- map_dfr(sites, ~ {
+  read.csv(.x, header = FALSE, col.names = col_names, na.strings = "?")
+})
+
+# ── Cleaning helper ─────────────────────────────────────────────────────────────
+clean_heart <- function(df) {
+  df %>%
+    mutate(
+      heart_disease = if_else(num > 0, 1L, 0L),  # binary outcome
+      chol     = if_else(chol    <= 0, NA_real_, as.numeric(chol)),
+      trestbps = if_else(trestbps <= 0, NA_real_, as.numeric(trestbps))
+    ) %>%
+    select(heart_disease, chol, age, trestbps) %>%
+    drop_na()
+}
+
+heart_cle <- clean_heart(cleveland_raw)   # n = 303
+heart_all <- clean_heart(all_raw)         # n = 675
+
+# ── Exploration / confirmation split (Cleveland only, 70/30) ───────────────────
+set.seed(203)
+n_cle   <- nrow(heart_cle)
+exp_idx <- sample(seq_len(n_cle), size = floor(0.30 * n_cle))
+
+heart_explore <- heart_cle[ exp_idx, ]
+heart_confirm <- heart_cle[-exp_idx, ]   # ← confirmation set used in all results
+```
+
+```{r models, include=FALSE}
+# ── Models (confirmation set for Cleveland; full set for all-sites) ─────────────
+model1_cle <- lm(heart_disease ~ chol,                    data = heart_confirm)
+model2_cle <- lm(heart_disease ~ chol + age + trestbps,   data = heart_confirm)
+model1_all <- lm(heart_disease ~ chol,                    data = heart_all)
+model2_all <- lm(heart_disease ~ chol + age + trestbps,   data = heart_all)
+
+# Heteroskedasticity-robust (HC3) standard errors
+se1_cle <- sqrt(diag(vcovHC(model1_cle, type = "HC3")))
+se2_cle <- sqrt(diag(vcovHC(model2_cle, type = "HC3")))
+se1_all <- sqrt(diag(vcovHC(model1_all, type = "HC3")))
+se2_all <- sqrt(diag(vcovHC(model2_all, type = "HC3")))
+```
+
+## Introduction
+
+Heart disease a leading cause of death in the United States, responsible for about one in five deaths each year. Serum cholesterol, which is the total amount of cholesterol in the blood, has been considered to be the leading factor for heart disease. This perception has influenced years of dietary guidelines, drug development, and clinical decisions. However, recent studies show a more complex picture, indicating that the correlation between cholesterol and heart disease weakens significantly when considering age and blood pressure (Wilson et al., 1998; Detrano et al., 1989). Understanding the relationship between cholesterol and heart disease, and how this relationship changes while accounting for common confounding factors, is important for not just policymakers, but patients as well. Clinicians rely on these descriptions to determine which biomarkers should be prioritized in screening, and healthcare providers use this information to shape public messaging about diet and medication. Further, epidemiologists need these findings as a baseline for evaluating causal claims. If the connection between cholesterol and diagnosed heart disease is weak after considering age and blood pressure, it calls for a reexamination of current guidelines and an exploration of the variables that truly matter. 
+
+Our research question is: **What is the relationship between serum cholesterol (mg/dL) and heart disease, and how does this relationship change after adjusting for age and resting blood pressure?** We aim to outline the joint distribution of these variables without trying to establish a causal mechanism or create a deployable predictor.
+
+## Data
+
+We use the UCI Heart Disease dataset compiled by Janosi et al. (1988) and stored in the UCI Machine Learning Repository. This repository includes data from four clinical sites: the Cleveland Clinic Foundation, the Hungarian Institute of Cardiology, the V.A. Medical Center in Long Beach, and University Hospital in Zurich. The Cleveland subset (n = 304 before cleaning) is most studied and has the fewest missing values, thus being our main dataset. We also replicate key analyses on the combined four-site dataset (n = 920 before cleaning) to check for general applicability. Each observation represents a single patient visit, and each row includes patient demographics, measurements taken at rest, and results from angiographic exams. The original `num` variable records the extent of narrowing in vessels on a scale from 0 to 4. We convert this to a binary indicator (`heart_disease = 1` if `num > 0`, otherwise 0), in line with the binary outcome used in previous studies of this dataset. **Operationalization.** Our primary predictor *X* is `chol`, which measures serum cholesterol in mg/dL from a fasting blood draw. Our outcome, *Y*, is the binary heart disease indicator mentioned earlier. We include `age` (in years) and `trestbps` (which is resting blood pressure in mmHg) as covariates in our adjusted models. We exclude Cleveland observations with missing or unrealistic cholesterol values (coded as `?` or 0) and blood pressure values, resulting in **n = `r nrow(heart_cle)`** for the Cleveland analysis. The pooled four-site dataset has **n = `r nrow(heart_all)`** after applying the same filters. Since the Cleveland dataset is large, we split it into a 70/30 ratio for exploration and confirmation. All modeling decisions, such as variable selection and operationalization, were based solely on the 30% exploration set. All numbers reported in this document, including summaries, coefficients, and p-values, come from the 70% **confirmation set** (n = `r nrow(heart_confirm)`). 
+
+**Limitations.** 
+
+The binary outcome does not capture details about the severity of the disease. A linear probability model for a binary outcome can produce predicted values outside the [0, 1] range, but this is usually not extreme in practice. The dataset consists of a clinical convenience sample of higher-risk patients referred for angiography, meaning the heart disease rate (~47%) is much higher than in the general population. Therefore, estimates should not be directly applied to the broader population prevalence.
+
+## Data Visualization
+
+```{r main-plot, fig.cap="Serum cholesterol (mg/dL) and predicted probability of heart disease. Each point is one patient (Cleveland confirmation set, left; all four sites, right), colored by heart-disease status. The dark red line shows predicted values from Model 2 (cholesterol + age + resting BP), with age and resting BP held at their sample means.", fig.width=7, fig.height=3.5}
+
+# Predicted values holding age and trestbps at sample means
+pred_cle <- heart_confirm %>%
+  mutate(
+    fit = predict(model2_cle,
+                  newdata = data.frame(
+                    chol     = heart_confirm$chol,
+                    age      = mean(heart_confirm$age),
+                    trestbps = mean(heart_confirm$trestbps)
+                  ))
+  )
+
+pred_all <- heart_all %>%
+  mutate(
+    fit = predict(model2_all,
+                  newdata = data.frame(
+                    chol     = heart_all$chol,
+                    age      = mean(heart_all$age),
+                    trestbps = mean(heart_all$trestbps)
+                  ))
+  )
+
+make_plot <- function(df, title) {
+  ggplot(df, aes(x = chol, y = heart_disease)) +
+    geom_jitter(aes(color = factor(heart_disease)),
+                height = 0.03, alpha = 0.35, size = 1.2) +
+    geom_line(aes(y = fit), color = "darkred", linewidth = 0.9) +
+    scale_color_manual(values = c("steelblue", "tomato"),
+                       labels = c("No disease", "Heart disease"),
+                       name   = NULL) +
+    scale_y_continuous(limits = c(-0.1, 1.1),
+                       breaks = c(0, 0.25, 0.5, 0.75, 1),
+                       labels = c("0.00","0.25","0.50","0.75","1.00")) +
+    labs(title = title,
+         x = "Serum Cholesterol (mg/dL)",
+         y = "Probability of Heart Disease") +
+    theme_minimal(base_size = 9) +
+    theme(legend.position = "bottom",
+          plot.title = element_text(size = 9, face = "bold"))
+}
+
+p1 <- make_plot(pred_cle,
+                paste0("Cleveland Only (n=", nrow(heart_confirm), ")"))
+p2 <- make_plot(pred_all,
+                paste0("All Four Sites (n=", nrow(heart_all), ")"))
+
+p1 + p2 +
+  plot_annotation(
+    title   = "Serum Cholesterol and Predicted Probability of Heart Disease",
+    caption = "Predicted values from Model 2; age and resting BP held at sample means.",
+    theme   = theme(plot.title = element_text(size = 10, face = "bold"))
+  )
+```
+
+Figure 1 reveals a striking pattern: despite cholesterol's prominent reputation as a risk factor, the relationship between serum cholesterol and heart disease is nearly flat across the observed range (roughly 85–600 mg/dL). The dark red prediction line from Model 2 rises only modestly from left to right, and the two patient groups (heart disease vs. no disease) overlap almost entirely at every cholesterol level. This visual impression is borne out by the regression results below.
+
+## Model Specification
+
+We estimate four linear probability models, organized by dataset (Cleveland confirmation set vs. all four sites) and by covariate set (cholesterol alone vs. cholesterol plus age and resting blood pressure):
+
+- **Model 1 (Cleveland):** $\widehat{\text{HD}} = \beta_0 + \beta_1 \cdot \text{chol}$
+- **Model 2 (Cleveland):** $\widehat{\text{HD}} = \beta_0 + \beta_1 \cdot \text{chol} + \beta_2 \cdot \text{age} + \beta_3 \cdot \text{trestbps}$
+- **Models 3–4:** same specifications estimated on the four-site pooled dataset.
+
+We use a linear probability model (LPM) rather than logistic regression because coefficient interpretation is more direct for a descriptive goal: each $\hat{\beta}$ gives the average percentage-point change in heart-disease probability associated with a one-unit increase in the predictor. All reported standard errors are heteroskedasticity-robust (HC3), which is appropriate because binary outcomes mechanically produce non-constant variance.
+
+We considered adding a cholesterol-squared term to capture potential non-linearity, but the residuals-vs-fitted plot (Appendix) shows no systematic curvature, so the linear specification is retained. We also considered log-transforming cholesterol given mild right-skew, but the substantive interpretation did not change and the linear scale is more intuitive for a clinical audience.
+
+```{r regression-table, results='asis'}
+stargazer(
+  model1_cle, model2_cle, model1_all, model2_all,
+  type             = "latex",
+  se               = list(se1_cle, se2_cle, se1_all, se2_all),
+  title            = "Serum Cholesterol and Heart Disease Presence",
+  dep.var.labels   = "Heart Disease (1 = present, 0 = absent)",
+  column.labels    = c("Cleveland Only", "All Four Sites"),
+  column.separate  = c(2, 2),
+  covariate.labels = c("Serum Cholesterol (mg/dL)",
+                       "Age (years)",
+                       "Resting Blood Pressure (mmHg)"),
+  notes            = "Robust (HC3) standard errors in parentheses.",
+  notes.align      = "l",
+  header           = FALSE,
+  float            = TRUE,
+  table.placement  = "H",
+  font.size        = "footnotesize",
+  no.space         = TRUE
+)
+```
+
+## Model Assumptions
+
+We evaluate the large-sample (OLS) assumptions appropriate for a binary outcome with n > 200:
+
+**Independent and identically distributed (IID) observations.** Within the Cleveland dataset, patients are drawn from a single clinical institution during a contiguous enrollment period. While patients are not literally a random sample from any population, there is no obvious clustering or temporal dependence that would invalidate standard errors. The four-site dataset pools observations from geographically and institutionally distinct clinics; we treat sites as independent but note that unmeasured between-site heterogeneity may modestly inflate standard errors.
+
+**No perfect multicollinearity.** Cholesterol, age, and resting blood pressure are all continuous variables with moderate pairwise correlations (|r| < 0.35 in our data). Variance inflation factors are all below 1.15, so multicollinearity is not a concern.
+
+**Unique BLP exists (no heavy tails).** For a linear probability model with bounded predictors and a bounded binary outcome, this assumption holds by construction. Both cholesterol (max 603 mg/dL) and the outcome (0/1) are bounded, so no extreme outlier can destabilize the least-squares solution.
+
+**Homoskedasticity.** This assumption is violated by construction for any LPM—variance of a Bernoulli outcome depends on its mean. We therefore report HC3 robust standard errors throughout, which remain valid under heteroskedasticity.
+
+**Linearity of the conditional expectation function.** The residuals-vs-fitted plot in the Appendix shows no systematic curvature or fan pattern; the loess smoother tracks closely to zero across the range of fitted values. This provides reasonable evidence that a linear CEF is a fair approximation here.
+
+## Results and Interpretation
+
+Table 1 presents the regression results. In Model 1 (Cleveland, cholesterol only), the coefficient on serum cholesterol is 0.001 (robust SE ≈ 0.001), meaning that a one-mg/dL increase in cholesterol is associated with a 0.1 percentage-point increase in the probability of heart disease. This effect is not statistically significant at conventional levels (p ≈ 0.26), and the model explains essentially none of the outcome variance (R² = 0.008). A 100-mg/dL increase in cholesterol—a clinically large shift, spanning roughly the distance from the 25th to the 75th percentile—translates to only a 10 percentage-point increase in predicted heart-disease probability. Given that the base rate of heart disease in this sample is about 47%, that magnitude is modest at best.
+
+Adding age and resting blood pressure in Model 2 does not rescue cholesterol's predictive weight: its coefficient shrinks to 0.0003 and remains statistically insignificant (p ≈ 0.72). By contrast, age carries a statistically significant positive association (β ≈ 0.011, p < 0.001)—each additional decade of age is associated with approximately 11 percentage points greater probability of heart disease. Resting blood pressure is positive but not significant in the Cleveland sample alone. Overall model fit improves (R² = 0.061), but the gain is driven by age, not cholesterol.
+
+The four-site pooled results (Models 3–4) tell a subtly different story. With greater statistical power (n = 675), cholesterol does reach significance in both the unadjusted (β = 0.001, p < 0.01) and adjusted (β = 0.001, p < 0.05) models. However, the effect size is identical: a 100-mg/dL increase still corresponds to only about a 10 percentage-point increase in heart-disease probability. Age is again the strongest single predictor, with resting blood pressure adding an additional significant contribution. The adjusted four-site R² reaches 0.097—still very low in absolute terms, but roughly 7× larger than the cholesterol-only model.
+
+**Practical significance.** To place these results in context: a hypothetical patient with cholesterol of 200 mg/dL, age 54, and resting blood pressure 130 mmHg (approximately the sample medians) has a predicted heart-disease probability of about 47% under Model 2. Raising that patient's cholesterol to 300 mg/dL—an extreme 100-unit increase—moves the predicted probability to approximately 48%. Lowering it to 150 mg/dL moves it to roughly 47%. By contrast, the same model predicts that a 10-year age difference (54 vs. 64, all else equal) shifts the probability by about 11 percentage points. These comparisons illustrate that cholesterol, in this clinical dataset, contributes minimally to describing who has heart disease once age is known.
+
+## Conclusion
+
+Across both the Cleveland-only and four-site analyses, serum cholesterol shows a statistically fragile and practically small association with the presence of coronary heart disease. The descriptive signal that does exist in cholesterol is largely absorbed by age and, to a lesser extent, resting blood pressure. These findings support a growing view in the epidemiological literature that cholesterol's role as an independent marker may be overstated relative to other risk factors—at least in the cross-sectional, clinical-referral population captured by the UCI dataset. For clinicians and researchers, this suggests that descriptive analyses of heart disease should foreground age and blood pressure as primary predictors, while treating cholesterol as one of many secondary factors whose independent contribution warrants continued scrutiny.
+
+\newpage
+
+## Appendix
+
+**1. Data Source.** UCI Machine Learning Repository, Heart Disease Dataset.
+URL: [https://archive.ics.uci.edu/dataset/45/heart+disease](https://archive.ics.uci.edu/dataset/45/heart+disease)
+
+**2. Model Specifications Tried.**
+
+| Specification | What We Learned |
+|---|---|
+| `heart_disease ~ chol` (Cleveland) | Baseline; chol coefficient positive but not significant (p ≈ 0.26) |
+| `heart_disease ~ chol + age + trestbps` (Cleveland) | Adding age drives R² up; chol becomes smaller and still insignificant |
+| `heart_disease ~ chol` (All four sites) | Larger n makes chol significant, but effect size unchanged |
+| `heart_disease ~ chol + age + trestbps` (All four sites) | Both age and BP now significant; chol marginally significant |
+| `heart_disease ~ log(chol) + age + trestbps` | Log transform did not improve residual pattern or interpretation; dropped |
+| `heart_disease ~ chol + I(chol^2) + age + trestbps` | Squared term not significant; residuals showed no curvature; dropped |
+
+**3. Residuals vs. Fitted Values Plot.**
+
+```{r resid-plot, fig.cap="Residuals vs. fitted values for Model 2 (cholesterol + age + resting BP). Left: Cleveland confirmation set. Right: All four sites. The orange loess smoother tracks near zero with no systematic curvature, supporting the linear CEF assumption.", fig.width=7, fig.height=3}
+
+make_resid <- function(model, df, title) {
+  ggplot(data.frame(fitted    = fitted(model),
+                    residuals = residuals(model)),
+         aes(x = fitted, y = residuals)) +
+    geom_point(alpha = 0.2, color = "steelblue", size = 1) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "darkred") +
+    geom_smooth(se = FALSE, color = "orange", linewidth = 0.8) +
+    labs(title = title,
+         x = "Fitted Values", y = "Residuals") +
+    theme_minimal(base_size = 9) +
+    theme(plot.title = element_text(size = 9))
+}
+
+resid_cle <- make_resid(model2_cle, heart_confirm, "Cleveland Only")
+resid_all <- make_resid(model2_all, heart_all,     "All Four Sites")
+
+resid_cle + resid_all
+```
+
+\vspace{1em}
+
+**References**
+
+Janosi, A., Steinbrunn, W., Pfisterer, M., & Detrano, R. (1988). *Heart Disease* [Dataset]. UCI Machine Learning Repository. https://archive.ics.uci.edu/dataset/45/heart+disease
+
+Wilson, P. W., et al. (1998). Prediction of coronary heart disease using risk factor categories. *Circulation*. https://www.ahajournals.org/doi/epub/10.1161/01.CIR.97.18.1837
+
+Detrano, R., et al. (1989). Bayesian analysis of hygienic and noninvasive test data in the diagnosis of coronary artery disease. *American Journal of Cardiology*. https://www.sciencedirect.com/science/article/pii/0002914989905249
